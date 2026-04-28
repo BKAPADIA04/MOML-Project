@@ -1,17 +1,3 @@
-# ============================================================
-# Multi-Objective Optimisation of Fashion-MNIST CNN
-# Kaggle Notebook — Single File (GPU T4 x2)
-# ============================================================
-# INSTRUCTIONS:
-#   1. On Kaggle, create a new notebook.
-#   2. Set Accelerator → GPU T4 x2.
-#   3. Make sure Internet is ON (for Optuna install + dataset download).
-#   4. Paste this entire file OR copy each # %% cell one by one.
-#   5. Run all cells top to bottom.
-#   6. Results saved to /kaggle/working/results/
-# ============================================================
-
-
 # %% [markdown]
 # ## Cell 1 — Install Optuna
 
@@ -663,3 +649,196 @@ for f in sorted(os.listdir(RESULTS_DIR)):
     display(FileLink(fp))
 
 print("\n✅ All done! Download above or find files in /kaggle/working/results/")
+
+
+# %% [markdown]
+# ## Cell 17 — Pareto Quality Metrics: Hypervolume & Spacing Metric
+
+# %%
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helper: Non-dominated filter  (minimisation, all objectives)
+# ─────────────────────────────────────────────────────────────────────────────
+def _nd_filter(pts: np.ndarray) -> np.ndarray:
+    """Return non-dominated subset of pts (all objectives minimised)."""
+    mask = np.ones(len(pts), dtype=bool)
+    for i, p in enumerate(pts):
+        if not mask[i]:
+            continue
+        others = pts[mask]
+        if (np.all(others <= p, axis=1) & np.any(others < p, axis=1)).any():
+            mask[i] = False
+    return pts[mask]
+
+
+def _minmax_normalise(pts: np.ndarray, ref: np.ndarray) -> tuple:
+    """Min-max normalise pts and ref to [0,1] using column min & ref as max."""
+    ideal = pts.min(axis=0)
+    scale = ref - ideal
+    scale = np.where(scale == 0, 1.0, scale)
+    return (pts - ideal) / scale, np.ones_like(ref)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Hypervolume — WFG recursive algorithm (exact, no external libs)
+# ─────────────────────────────────────────────────────────────────────────────
+def _limit_pts(pts: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    if pts.size == 0:
+        return pts
+    clipped = np.maximum(pts, ref)
+    return clipped[np.all(clipped <= ref, axis=1)]
+
+
+def _wfg(pts: np.ndarray, ref: np.ndarray) -> float:
+    if pts.size == 0:
+        return 0.0
+    n, d = pts.shape
+    if d == 1:
+        return float(ref[0] - pts[:, 0].min())
+    pts = pts[np.argsort(pts[:, -1])]
+    hv = 0.0
+    for i, p in enumerate(pts):
+        depth = (pts[i + 1, -1] if i + 1 < n else ref[-1]) - p[-1]
+        if depth <= 0:
+            continue
+        dominated = _limit_pts(pts[i + 1:], p)
+        sub_pts = np.vstack([p[:-1], dominated[:, :-1]]) if dominated.size else p[:-1][np.newaxis]
+        hv += depth * _wfg(_nd_filter(sub_pts), ref[:-1])
+    return hv
+
+
+def compute_hypervolume(pareto_pts: np.ndarray, ref: np.ndarray) -> float:
+    """
+    Hypervolume Indicator (normalised).
+
+    Parameters
+    ----------
+    pareto_pts : (n, 3) array  — objectives in minimisation form
+                 [−accuracy, latency_ms, n_params]
+    ref        : (3,)   array  — reference (worst acceptable) point
+
+    Returns
+    -------
+    float  Normalised hypervolume in [0, 1].
+    """
+    feasible = pareto_pts[np.all(pareto_pts < ref, axis=1)]
+    nd_pts   = _nd_filter(feasible)
+    norm_pts, norm_ref = _minmax_normalise(nd_pts, ref)
+    return _wfg(norm_pts, norm_ref)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Spacing Metric — Schott (1995)
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_spacing(pareto_pts: np.ndarray) -> dict:
+    """
+    Spacing Metric SP — uniformity of Pareto front distribution.
+
+    SP = sqrt( mean_i( (d̄ - d_i)² ) )
+
+    where d_i = min_{j≠i} ||pts_i - pts_j||₂  in normalised objective space.
+
+    Parameters
+    ----------
+    pareto_pts : (n, 3) array — objectives in minimisation form (raw values).
+                 Normalised internally before distance computation.
+
+    Returns
+    -------
+    dict  with keys sp, d_mean, d_min, d_max, d_values.
+    """
+    # Normalise each objective to [0, 1]
+    col_min   = pareto_pts.min(axis=0)
+    col_range = pareto_pts.max(axis=0) - col_min
+    col_range = np.where(col_range == 0, 1.0, col_range)
+    pts = (pareto_pts - col_min) / col_range
+
+    n = len(pts)
+    d = np.empty(n)
+    for i in range(n):
+        dists    = np.linalg.norm(pts - pts[i], axis=1)
+        dists[i] = np.inf
+        d[i]     = dists.min()
+
+    d_mean = d.mean()
+    sp     = float(np.sqrt(np.mean((d_mean - d) ** 2)))
+    return {"sp": sp, "d_mean": float(d_mean),
+            "d_min": float(d.min()), "d_max": float(d.max()),
+            "d_values": d.tolist()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Run on the live Pareto front
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Reference point: worst acceptable values (all objectives in minimisation form)
+#   O1 = −accuracy  →  −0.30  (accuracy ≤ 0.30 is unacceptable)
+#   O2 = latency_ms →   4.00 ms
+#   O3 = n_params   → 700,000
+REF_POINT = np.array([-0.30, 4.00, 700_000.0])
+
+# Build (n, 3) minimisation array from the live pareto_df
+pareto_min = np.column_stack([
+    -pareto_df["val_accuracy"].values,   # negate: maximise → minimise
+     pareto_df["inference_ms"].values,
+     pareto_df["n_params"].values.astype(float),
+])
+
+n_pareto = len(pareto_min)
+
+# ── Hypervolume ───────────────────────────────────────────────────────────────
+hv = compute_hypervolume(pareto_min, REF_POINT)
+
+# ── Spacing Metric ────────────────────────────────────────────────────────────
+sp_result = compute_spacing(pareto_min)
+
+# ── Per-solution nearest-neighbour table ──────────────────────────────────────
+print("=" * 60)
+print(f"  PARETO QUALITY METRICS  ({n_pareto} solutions)")
+print("=" * 60)
+
+print(f"\n{'Solution':<10}  {'Val Acc':>8}  {'Latency (ms)':>13}  {'Params':>10}  {'d_i (NN)':>10}")
+print("-" * 60)
+d_vals = sp_result["d_values"]
+for idx, (_, row) in enumerate(pareto_df.iterrows()):
+    print(
+        f"  P{idx+1:02d}      "
+        f"  {row['val_accuracy']:>8.4f}"
+        f"  {row['inference_ms']:>13.4f}"
+        f"  {int(row['n_params']):>10,}"
+        f"  {d_vals[idx]:>10.6f}"
+    )
+
+print("-" * 60)
+print(f"\n  {'Hypervolume Indicator  HV':<35}:  {hv:.6f}")
+print(f"  {'Spacing Metric         SP':<35}:  {sp_result['sp']:.6f}")
+print(f"  {'Mean NN distance       d̄':<35}:  {sp_result['d_mean']:.6f}")
+print(f"  {'Min  NN distance       d_min':<35}:  {sp_result['d_min']:.6f}")
+print(f"  {'Max  NN distance       d_max':<35}:  {sp_result['d_max']:.6f}")
+print("=" * 60)
+
+# ── Qualitative interpretation ────────────────────────────────────────────────
+sp_val = sp_result["sp"]
+if   sp_val < 0.05:  sp_quality = "Excellent — very uniform spread."
+elif sp_val < 0.10:  sp_quality = "Good spread with minor clustering."
+elif sp_val < 0.20:  sp_quality = "Moderate spread; some gaps in the front."
+else:                sp_quality = "Poor spread; front is highly irregular."
+
+print(f"\n  HV  interpretation: {hv*100:.1f}% of normalised objective space dominated.")
+print(f"  SP  interpretation: {sp_quality}")
+
+# ── Save metrics to CSV ───────────────────────────────────────────────────────
+metrics_dict = {
+    "n_pareto_solutions": [n_pareto],
+    "hypervolume_HV":     [round(hv, 6)],
+    "spacing_SP":         [round(sp_result["sp"], 6)],
+    "mean_nn_distance":   [round(sp_result["d_mean"], 6)],
+    "min_nn_distance":    [round(sp_result["d_min"], 6)],
+    "max_nn_distance":    [round(sp_result["d_max"], 6)],
+    "ref_neg_accuracy":   [REF_POINT[0]],
+    "ref_latency_ms":     [REF_POINT[1]],
+    "ref_n_params":       [REF_POINT[2]],
+}
+metrics_csv = os.path.join(RESULTS_DIR, "pareto_metrics.csv")
+pd.DataFrame(metrics_dict).to_csv(metrics_csv, index=False)
+print(f"\n✓ Metrics saved → {metrics_csv}")
+
