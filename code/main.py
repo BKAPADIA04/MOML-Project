@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 import optuna
 import pandas as pd
 
-from objective import make_objective
-from utils import set_seed
-from visualize import (
+from code.objective import make_objective
+from code.utils import set_seed
+from code.visualize import (
     extract_pareto_front,
     plot_2d_pareto,
     plot_3d_pareto,

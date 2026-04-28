@@ -18,9 +18,9 @@ import optuna
 import torch
 import torch.optim as optim
 
-from data import get_dataloaders
-from model import ConfigurableCNN, count_parameters
-from utils import measure_inference_time, set_seed, train_model
+from code.data import get_dataloaders
+from code.model import ConfigurableCNN, count_parameters
+from code.utils import measure_inference_time, set_seed, train_model
 
 # Fixed constants (keep search efficient)
 N_CLASSES = 10
